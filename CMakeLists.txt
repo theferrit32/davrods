@@ -62,6 +62,12 @@ add_compile_options(-Wall
                     -DDAVRODS_ENABLE_PROVIDER_NOLOCKS
                     -DDAVRODS_ENABLE_PROVIDER_LOCALLOCK)
 
+option(DAVRODS_DEBUG_MODE "Davrods debug build mode (will print *very* verbose debug output in Apache's error log)" OFF)
+
+if(DAVRODS_DEBUG_MODE)
+  add_compile_options(-DDAVRODS_DEBUG_VERY_DESPERATE)
+endif()
+
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,relro,-z,now")
 
 set(SOURCES

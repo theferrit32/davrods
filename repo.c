@@ -43,6 +43,9 @@ APLOG_USE_MODULE(davrods);
  * \return a pointer pointing within path
  */
 static const char *get_basename(const char *path) {
+    if (!path)
+        return NULL;
+
     size_t len = strlen(path);
     if (!len)
         return path;
@@ -56,6 +59,195 @@ static const char *get_basename(const char *path) {
 
     return path;
 }
+
+/**
+ * \brief Linked-list struct that provides a subset of iRODS collEnt_t info.
+ *
+ * For use in collentry lists to filter stale replica info.
+ *
+ * \see filter_read_collection()
+ */
+typedef struct collentry_subset_t {
+    const char *data_id;  ///< only valid when type = DATA_OBJ_T
+    const char *name;
+    const char *owner;
+    const char *modify_time;
+    const char *create_time;
+    size_t size;          ///< only valid when type = DATA_OBJ_T
+    objType_t type;       ///< DATA_OBJ_T or COLL_OBJ_T
+    bool   clean_replica; ///< When DATA_OBJ_T: False = stale, True = up-to-date
+
+    struct collentry_subset_t *next;
+
+} collentry_subset_t;
+
+/**
+ * \brief Read a collection and filter stale replica system metadata.
+ *
+ * When stale replicas exist, only clean replica system metadata is returned.
+ *
+ * This function is needed on order to work around the following iRODS issue:
+ * https://github.com/irods/irods/issues/3624
+ *
+ * \param[in]  resource The collection resource to read
+ * \param[out] result   A linked list of directory contents
+ *
+ * \return A dav error, when things go wrong
+ */
+static dav_error *filter_read_collection(const dav_resource   *resource,
+                                         collentry_subset_t  **result) {
+
+    WHISPER("#### FILTER READ COLL ####\n");
+    WHISPER("Opening iRODS collection <%s>\n", resource->info->rods_path);
+
+    collHandle_t coll_handle = { 0 };
+    int status = rclOpenCollection(
+        resource->info->rods_conn,
+        resource->info->rods_path,
+        // Need LONG_METADATA_FG to get repl status and owner info.
+        // Need NO_TRIM_REPL_FG so we can select only clean/up-to-date
+        // repl system metadata.
+        LONG_METADATA_FG | NO_TRIM_REPL_FG,
+        &coll_handle
+    );
+
+    if (status < 0) {
+        ap_log_rerror(
+            APLOG_MARK, APLOG_ERR, APR_SUCCESS, resource->info->r,
+            "rcOpenCollection failed: %d = %s", status, get_rods_error_msg(status)
+        );
+
+        return dav_new_error(
+            resource->pool, HTTP_INTERNAL_SERVER_ERROR, 0, status,
+            "Could not open a collection"
+        );
+    }
+
+    collEnt_t coll_entry;
+    *result = NULL; // The head of the list.
+    collentry_subset_t *tail = NULL;
+
+    WHISPER("Entering read loop of iRODS collection <%s>\n", resource->info->rods_path);
+
+    do {
+        status = rclReadCollection(resource->info->rods_conn, &coll_handle, &coll_entry);
+
+        if (status < 0) {
+            if (status == CAT_NO_ROWS_FOUND) {
+                WHISPER("Reached end of collection <%s>.\n", resource->info->rods_path);
+            } else {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, resource->info->r,
+                    "rclReadCollection failed for collection <%s> with error <%s>",
+                    resource->info->rods_path, get_rods_error_msg(status)
+                );
+                return dav_new_error(
+                    resource->pool, HTTP_INTERNAL_SERVER_ERROR, 0, 0,
+                    "Could not read a collection entry from a collection."
+                );
+            }
+        } else {
+            if (coll_entry.objType == DATA_OBJ_T || coll_entry.objType == COLL_OBJ_T) {
+
+                collentry_subset_t *current = apr_pcalloc(resource->pool, sizeof(collentry_subset_t));
+                assert(current);
+                current->type  = coll_entry.objType;
+                current->data_id = (current->type == DATA_OBJ_T
+                                    ? apr_pstrdup(resource->pool, coll_entry.dataId)
+                                    : "");
+                current->name  = apr_pstrdup(resource->pool,
+                                             current->type == DATA_OBJ_T
+                                             ? coll_entry.dataName
+                                             : get_basename(coll_entry.collName));
+                current->owner = apr_pstrdup(resource->pool, coll_entry.ownerName);
+                current->modify_time = apr_pstrdup(resource->pool, coll_entry.modifyTime);
+                current->create_time = apr_pstrdup(resource->pool, coll_entry.createTime);
+                assert(current->data_id && current->name && current->owner && current->modify_time && current->create_time);
+                current->size = coll_entry.dataSize;
+                current->clean_replica = coll_entry.replStatus == 1;
+
+                WHISPER("Got object with name <%s>, size <%lu> and repl status <%d>\n",
+                        current->name,
+                        current->size,
+                        current->clean_replica);
+
+                if (coll_entry.objType == DATA_OBJ_T) {
+                    // Check if we already have this data object, and
+                    // whether the current entry has more up-to-date
+                    // system metadata.
+
+                    bool handled_current = false;
+                    collentry_subset_t *seen = *result;
+                    collentry_subset_t *prev = NULL;
+                    while (seen) {
+                        if (seen->type == DATA_OBJ_T && !strcmp(seen->data_id, current->data_id)) {
+                            // Same data object. Find out which one to keep.
+                            if (seen->clean_replica || (!seen->clean_replica && !current->clean_replica)) {
+                                // Existing one is either better or just as bad, keep it.
+                                WHISPER("Found dupe: id <%s>   --> keep\n", seen->data_id);
+                            } else {
+                                WHISPER("Found dupe: id <%s>   --> replace\n", seen->data_id);
+                                // Existing one is stale and we now have a clean replica, replace the stale one.
+                                // The clean entry will take the stale one's place.
+
+                                // Update all variables that pointed to the stale version.
+                                if (prev) {
+                                    // Update entry *before* stale one to point to the clean entry.
+                                    prev->next = current;
+                                }
+                                if (seen == *result)
+                                    *result = current;
+                                if (seen == tail)
+                                    tail = current;
+
+                                current->next = seen->next;
+                            }
+
+                            handled_current = true;
+                            break;
+                        }
+                        prev = seen;
+                        seen = seen->next;
+                    }
+
+                    if (handled_current) {
+                        // We either replaced an existing entry or we
+                        // already have a good enough entry for this
+                        // data id. Go to the next object.
+                        continue;
+                    }
+                }
+
+                // Append the object to the list.
+                if (tail)
+                    tail->next = current;
+                tail = current;
+
+                if (!*result)
+                    *result = current;
+            }
+        }
+    } while (status >= 0);
+
+    rclCloseCollection(&coll_handle);
+
+    WHISPER("#### FILTERED         ####\n");
+
+    {
+        collentry_subset_t *current = *result;
+        while (current) {
+            WHISPER("Got object with name <%s>, size <%lu> and repl status <%d>\n",
+                    current->name,
+                    current->size,
+                    current->clean_replica);
+            current = current->next;
+        }
+    }
+
+    WHISPER("#### END OF READ COLL ####\n");
+
+    return NULL;
+}
+
 
 /**
  * \brief Obtain the fully inited Davrods memory pool.
@@ -1069,27 +1261,11 @@ static dav_error *deliver_directory(
     ap_filter_t *output
 ) {
     // Print a basic HTML directory listing.
-    collInp_t coll_inp = {{ 0 }};
-    strcpy(coll_inp.collName, resource->info->rods_path);
 
-    collHandle_t coll_handle = { 0 };
-
-    // Open the collection.
-    collEnt_t    coll_entry;
-    int status = rclOpenCollection(
-        resource->info->rods_conn,
-        resource->info->rods_path,
-        LONG_METADATA_FG,
-        &coll_handle
-    );
-
-    if (status < 0) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, resource->info->r,
-                      "rcOpenCollection failed: %d = %s", status, get_rods_error_msg(status));
-
-        return dav_new_error(resource->pool, HTTP_INTERNAL_SERVER_ERROR, 0, status,
-                             "Could not open a collection");
-    }
+    collentry_subset_t *entry = NULL; // Linked list of dirents.
+    dav_error *e = filter_read_collection(resource, &entry);
+    if (e)
+        return e;
 
     // Make brigade.
     apr_pool_t         *pool = resource->pool;
@@ -1135,90 +1311,76 @@ static dav_error *deliver_directory(
 
     apr_brigade_puts(bb, NULL, NULL,
                      "<table>\n<thead>\n"
-                     "  <tr><th>Name</th><th>Size</th><th>Owner</th><th>Last modified</th></tr>\n"
+                     "  <tr><th class=\"name\">Name</th><th class=\"size\">Size</th><th class=\"owner\">Owner</th><th class=\"date\">Last modified</th></tr>\n"
                      "</thead>\n<tbody>\n");
 
     // Actually print the directory listing, one table row at a time.
-    do {
-        status = rclReadCollection(resource->info->rods_conn, &coll_handle, &coll_entry);
+    while (entry) {
+        apr_brigade_printf(bb, NULL, NULL, "  <tr class=\"object%s\">",
+                           entry->type == COLL_OBJ_T ? " collection"
+                           : entry->type == DATA_OBJ_T ? " data-object"
+                           : "");
 
-        if (status < 0) {
-            if (status == CAT_NO_ROWS_FOUND) {
-                // End of collection.
-            } else {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, resource->info->r,
-                              "rcReadCollection failed for collection <%s> with error <%s>",
-                              resource->info->rods_path, get_rods_error_msg(status));
-
-                apr_brigade_destroy(bb);
-
-                return dav_new_error(resource->pool, HTTP_INTERNAL_SERVER_ERROR, 0, 0,
-                                     "Could not read a collection entry from a collection.");
-            }
+        // Generate link.
+        if (entry->type == COLL_OBJ_T) {
+            // Collection links need a trailing slash for the '..' links to work correctly.
+            apr_brigade_printf(bb, NULL, NULL, "<td class=\"name\"><a href=\"%s/\">%s/</a></td>",
+                               ap_escape_html(pool, ap_escape_uri(pool, entry->name)),
+                               ap_escape_html(pool, entry->name));
         } else {
-            apr_brigade_puts(bb, NULL, NULL, "  <tr>");
-
-            const char *name = coll_entry.objType == DATA_OBJ_T
-                ? coll_entry.dataName
-                : get_basename(coll_entry.collName);
-
-            // Generate link.
-            if (coll_entry.objType == COLL_OBJ_T) {
-                // Collection links need a trailing slash for the '..' links to work correctly.
-                apr_brigade_printf(bb, NULL, NULL, "<td><a href=\"%s/\">%s/</a></td>",
-                                   ap_escape_html(pool, ap_escape_uri(pool, name)),
-                                   ap_escape_html(pool, name));
-            } else {
-                apr_brigade_printf(bb, NULL, NULL, "<td><a href=\"%s\">%s</a></td>",
-                                   ap_escape_html(pool, ap_escape_uri(pool, name)),
-                                   ap_escape_html(pool, name));
-            }
-
-            // Print data object size.
-            if (coll_entry.objType == DATA_OBJ_T) {
-                char size_buf[5] = { 0 };
-                // Fancy file size formatting.
-                apr_strfsize(coll_entry.dataSize, size_buf);
-                if (size_buf[0])
-                    apr_brigade_printf(bb, NULL, NULL, "<td>%s</td>", size_buf);
-                else
-                    apr_brigade_printf(bb, NULL, NULL, "<td>%lu</td>", coll_entry.dataSize);
-            } else {
-                apr_brigade_puts(bb, NULL, NULL, "<td></td>");
-            }
-
-            // Print owner.
-            apr_brigade_printf(bb, NULL, NULL, "<td>%s</td>",
-                               ap_escape_html(pool, coll_entry.ownerName));
-
-            // Print modified-date string.
-            uint64_t       timestamp    = atoll(coll_entry.modifyTime);
-            apr_time_t     apr_time     = 0;
-            apr_time_exp_t exploded     = { 0 };
-            char           date_str[64] = { 0 };
-
-            apr_time_ansi_put(&apr_time, timestamp);
-            apr_time_exp_lt(&exploded, apr_time);
-
-            size_t ret_size;
-            if (!apr_strftime(date_str, &ret_size, sizeof(date_str), "%Y-%m-%d %H:%M", &exploded)) {
-                apr_brigade_printf(bb, NULL, NULL, "<td>%s</td>",
-                                   ap_escape_html(pool, date_str));
-            } else {
-                // Fallback, just in case.
-                static_assert(sizeof(date_str) >= APR_RFC822_DATE_LEN,
-                              "Size of date_str buffer too low for RFC822 date");
-                int status = apr_rfc822_date(date_str, timestamp*1000*1000);
-                apr_brigade_printf(bb, NULL, NULL, "<td>%s</td>",
-                                   ap_escape_html(pool, status >= 0 ? date_str : "Thu, 01 Jan 1970 00:00:00 GMT"));
-            }
-
-            apr_brigade_puts(bb, NULL, NULL, "</tr>\n");
+            apr_brigade_printf(bb, NULL, NULL, "<td class=\"name\"><a href=\"%s\">%s</a></td>",
+                               ap_escape_html(pool, ap_escape_uri(pool, entry->name)),
+                               ap_escape_html(pool, entry->name));
         }
-    } while (status >= 0);
+
+        // Print data object size.
+        if (entry->type == DATA_OBJ_T) {
+            char size_buf[5] = { 0 };
+            // Fancy file size formatting.
+            apr_strfsize(entry->size, size_buf);
+            if (size_buf[0])
+                apr_brigade_printf(bb, NULL, NULL, "<td class=\"size\">%s</td>", size_buf);
+            else
+                apr_brigade_printf(bb, NULL, NULL, "<td class=\"size\">%lu</td>", entry->size);
+        } else {
+            apr_brigade_puts(bb, NULL, NULL, "<td class=\"size\"></td>");
+        }
+
+        // Print owner.
+        apr_brigade_printf(bb, NULL, NULL, "<td class=\"owner\">%s</td>",
+                           ap_escape_html(pool, entry->owner));
+
+        // Print modified-date string.
+        uint64_t       timestamp    = atoll(entry->modify_time);
+        apr_time_t     apr_time     = 0;
+        apr_time_exp_t exploded     = { 0 };
+        char           date_str[64] = { 0 };
+
+        apr_time_ansi_put(&apr_time, timestamp);
+        apr_time_exp_lt(&exploded, apr_time);
+
+        size_t ret_size;
+        if (!apr_strftime(date_str, &ret_size, sizeof(date_str), "%Y-%m-%d %H:%M", &exploded)) {
+            apr_brigade_printf(bb, NULL, NULL, "<td class=\"date\">%s</td>",
+                               ap_escape_html(pool, date_str));
+        } else {
+            // Fallback, just in case.
+            static_assert(sizeof(date_str) >= APR_RFC822_DATE_LEN,
+                          "Size of date_str buffer too low for RFC822 date");
+            int status = apr_rfc822_date(date_str, timestamp*1000*1000);
+            apr_brigade_printf(bb, NULL, NULL, "<td class=\"date\">%s</td>",
+                               ap_escape_html(pool, status >= 0 ? date_str : "Thu, 01 Jan 1970 00:00:00 GMT"));
+        }
+
+        apr_brigade_puts(bb, NULL, NULL, "</tr>\n");
+
+        entry = entry->next;
+    }
 
     // End HTML document.
     apr_brigade_puts(bb, NULL, NULL, "</tbody>\n</table>\n</body>\n</html>\n");
+
+    int status;
 
     // Flush.
     if ((status = ap_pass_brigade(output, bb)) != APR_SUCCESS) {
@@ -1380,28 +1542,7 @@ static dav_error *walker(
         return NULL;
     }
 
-    collHandle_t coll_handle;
-    collEnt_t    coll_entry;
-
-    WHISPER("Opening iRODS collection <%s> \n", ctx->resource.info->rods_path);
-
-    int status = rclOpenCollection(
-        ctx->resource.info->rods_conn,
-        ctx->resource.info->rods_path,
-        0,
-        &coll_handle
-    );
-    if (status < 0) {
-        ap_log_rerror(
-            APLOG_MARK, APLOG_ERR, APR_SUCCESS, ctx->resource.info->r,
-            "rcOpenCollection failed: %d = %s", status, get_rods_error_msg(status)
-        );
-
-        return dav_new_error(
-            ctx->resource.pool, HTTP_INTERNAL_SERVER_ERROR, 0, status,
-            "Could not open a collection"
-        );
-    }
+    // Current resource is a collection - walk over its child objects.
 
     size_t rods_path_len = strlen(ctx->resource.info->rods_path);
     size_t       uri_len = strlen(ctx->uri_buffer);
@@ -1410,89 +1551,70 @@ static dav_error *walker(
     // out existing resource if a LOCKNULL walk was requested.
     walker_seen_resource_t *seen_resource = NULL;
 
-    WHISPER("Entering read loop of iRODS collection <%s>\n", ctx->resource.info->rods_path);
+    collentry_subset_t *entry = NULL; // Linked list of dirents.
+    err = filter_read_collection(&ctx->resource, &entry);
+    if (err)
+        return err;
 
-    do {
-        status = rclReadCollection(ctx->resource.info->rods_conn, &coll_handle, &coll_entry);
+    while (entry) {
+        WHISPER("Got a collection entry: %s '%s', %" DAVRODS_SIZE_T_FMT " bytes\n",
+            entry->type == DATA_OBJ_T
+                ? "Data object"
+                : entry->type == COLL_OBJ_T
+                    ? "Collection"
+                    : "Thing",
+            entry->name,
+            entry->size
+        );
 
-        if (status < 0) {
-            if (status == CAT_NO_ROWS_FOUND) {
-                WHISPER("Reached end of collection <%s>.\n", ctx->resource.info->rods_path);
-            } else {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, ctx->resource.info->r,
-                    "rcReadCollection failed for collection <%s> with error <%s>",
-                    ctx->resource.info->rods_path, get_rods_error_msg(status)
-                );
-                // XXX: Perhaps report CONFLICT instead of depending on `status`?
-                //      How do clients handle this?
-                return dav_new_error(
-                    ctx->resource.pool, HTTP_INTERNAL_SERVER_ERROR, 0, 0,
-                    "Could not read a collection entry from a collection."
-                );
-            }
-        } else {
-            const char *name = coll_entry.objType == DATA_OBJ_T
-                ? coll_entry.dataName
-                : get_basename(coll_entry.collName);
-
-            WHISPER("Got a collection entry: %s '%s', %" DAVRODS_SIZE_T_FMT " bytes\n",
-                coll_entry.objType == DATA_OBJ_T
-                    ? "Data object"
-                    : coll_entry.objType == COLL_OBJ_T
-                        ? "Collection"
-                        : "Thing",
-                name,
-                coll_entry.dataSize
+        if (
+                     uri_len + 1 + strlen(entry->name) >= MAX_NAME_LEN
+            || rods_path_len + 1 + strlen(entry->name) >= MAX_NAME_LEN
+        ) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, ctx->resource.info->r,
+                "Generated an uri or iRODS path exceeding iRODS path length limits"
             );
-
-            if (
-                         uri_len + 1 + strlen(name) >= MAX_NAME_LEN
-                || rods_path_len + 1 + strlen(name) >= MAX_NAME_LEN
-            ) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, ctx->resource.info->r,
-                    "Generated an uri or iRODS path exceeding iRODS path length limits"
-                );
-                return dav_new_error(
-                    ctx->resource.pool, HTTP_INTERNAL_SERVER_ERROR, 0, 0,
-                    "Path name too long"
-                );
-            }
-
-            // Transform resource struct into child resource struct.
-            // Perform the same path translation on both rods_path and uri.
-
-            if (strcmp(ctx->uri_buffer, "/") == 0) {
-                strcat(ctx->uri_buffer, name);
-            } else {
-                ctx->uri_buffer[uri_len] = '/';
-                strcpy(ctx->uri_buffer + uri_len + 1, name);
-            }
-            if (strcmp(ctx->resource.info->rods_path, "/") == 0) {
-                strcat(ctx->resource.info->rods_path, name);
-            } else {
-                ctx->resource.info->rods_path[rods_path_len] = '/';
-                strcpy(ctx->resource.info->rods_path + rods_path_len + 1, name);
-            }
-
-            ctx->resource.exists     = 1;
-            ctx->resource.collection = (coll_entry.objType == COLL_OBJ_T);
-
-            assert(ctx->resource.info->stat);
-
-            ctx->resource.info->stat->objSize = ctx->resource.collection ? 0 : coll_entry.dataSize;
-            strncpy(ctx->resource.info->stat->modifyTime, coll_entry.modifyTime, sizeof(ctx->resource.info->stat->modifyTime));
-            strncpy(ctx->resource.info->stat->createTime, coll_entry.createTime, sizeof(ctx->resource.info->stat->createTime));
-
-            walker_push_seen_path(ctx->resource.pool, &seen_resource, ctx->resource.info->rods_path);
-
-            walker(ctx, depth - 1);
-
-            // Reset resource paths to original.
-            ctx->uri_buffer[uri_len]                     = '\0';
-            ctx->resource.info->rods_path[rods_path_len] = '\0';
+            return dav_new_error(
+                ctx->resource.pool, HTTP_INTERNAL_SERVER_ERROR, 0, 0,
+                "Path name too long"
+            );
         }
 
-    } while (status >= 0);
+        // Transform resource struct into child resource struct.
+        // Perform the same path translation on both rods_path and uri.
+
+        if (strcmp(ctx->uri_buffer, "/") == 0) {
+            strcat(ctx->uri_buffer, entry->name);
+        } else {
+            ctx->uri_buffer[uri_len] = '/';
+            strcpy(ctx->uri_buffer + uri_len + 1, entry->name);
+        }
+        if (strcmp(ctx->resource.info->rods_path, "/") == 0) {
+            strcat(ctx->resource.info->rods_path, entry->name);
+        } else {
+            ctx->resource.info->rods_path[rods_path_len] = '/';
+            strcpy(ctx->resource.info->rods_path + rods_path_len + 1, entry->name);
+        }
+
+        ctx->resource.exists     = 1;
+        ctx->resource.collection = (entry->type == COLL_OBJ_T);
+
+        assert(ctx->resource.info->stat);
+
+        ctx->resource.info->stat->objSize = ctx->resource.collection ? 0 : entry->size;
+        strncpy(ctx->resource.info->stat->modifyTime, entry->modify_time, sizeof(ctx->resource.info->stat->modifyTime));
+        strncpy(ctx->resource.info->stat->createTime, entry->create_time, sizeof(ctx->resource.info->stat->createTime));
+
+        walker_push_seen_path(ctx->resource.pool, &seen_resource, ctx->resource.info->rods_path);
+
+        walker(ctx, depth - 1);
+
+        // Reset resource paths to original.
+        ctx->uri_buffer[uri_len]                     = '\0';
+        ctx->resource.info->rods_path[rods_path_len] = '\0';
+
+        entry = entry->next;
+    }
 
     if (ctx->params->walk_type & DAV_WALKTYPE_LOCKNULL) {
         // A LOCKNULL walk must call the callback function for
@@ -1510,7 +1632,8 @@ static dav_error *walker(
         // There's also the issue that mod_dav_lock locks by URI. We
         // cannot use that since the same URI may lead to different
         // resources for different users, depending on the
-        // DavrodsExposedRoot setting.
+        // DavrodsExposedRoot setting. So in our version we lock by
+        // iRODS path.
         extern const dav_provider davrods_dav_provider_locallock;
 
         dav_lockdb *db = ctx->params->lockdb;
