@@ -29,6 +29,7 @@
 typedef enum davrods_auth_scheme_t {
     DAVRODS_AUTH_NATIVE = 1,
     DAVRODS_AUTH_PAM,
+    DAVRODS_AUTH_OPENID
 } davrods_auth_scheme_t;
 
 typedef enum davrods_anon_mode_t {

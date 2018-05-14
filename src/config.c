@@ -169,6 +169,8 @@ static const char *cmd_davrodsauthscheme(
         conf->rods_auth_scheme = DAVRODS_AUTH_NATIVE;
     } else if (!strcasecmp("PAM", arg1)) {
         conf->rods_auth_scheme = DAVRODS_AUTH_PAM;
+    } else if (!strcasecmp("openid", arg1)) {
+        conf->rods_auth_scheme = DAVRODS_AUTH_OPENID;
     } else if (!strcasecmp("Standard", arg1)) {
         return "Invalid iRODS authentication scheme. Did you mean 'Native'?";
     } else {
