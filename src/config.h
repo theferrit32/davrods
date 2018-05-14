@@ -48,6 +48,7 @@ typedef struct {
     enum {
         DAVRODS_AUTH_NATIVE = 1,
         DAVRODS_AUTH_PAM,
+        DAVRODS_AUTH_OPENID
     } rods_auth_scheme;
 
     enum {

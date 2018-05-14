@@ -49,6 +49,15 @@ static apr_status_t rods_conn_cleanup(void *mem) {
     return APR_SUCCESS;
 }
 
+static int do_rods_login_openid(
+    request_rec *r,
+    rcComm_t    *rods_conn,
+    const char  *password
+) {
+    // TODO
+    return -1;
+}
+
 /**
  * \brief Perform an iRODS PAM login, return a temporary password.
  *
@@ -253,6 +262,13 @@ static authn_status rods_login(
                 status = clientLoginWithPassword(*rods_conn, password_buf);
             }
 
+        } else if (conf->rods_auth_scheme == DAVRODS_AUTH_OPENID) {
+            //TODO openid flow using he password as token
+            status = do_rods_login_openid(
+                r,
+                *rods_conn,
+                password_buf
+            )
         } else if (conf->rods_auth_scheme == DAVRODS_AUTH_NATIVE) {
             status = clientLoginWithPassword(*rods_conn, password_buf);
         } else {
