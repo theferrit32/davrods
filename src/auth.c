@@ -54,8 +54,20 @@ static int do_rods_login_openid(
     rcComm_t    *rods_conn,
     const char  *password
 ) {
-    // TODO
-    return -1;
+    // password here is really the session_id for irods
+    int status;
+    if ( password ) {
+        status = clientLoginOpenID(rods_conn, password, 0);
+    }
+    else {
+        status = clientLoginOpenID(rods_conn, password, 0);
+    }
+    if ( status < 0 ) {
+        ap_log_rerror(APLOG_MARK, APLOG_NOTICE, APR_SUCCESS, r,
+                "clientLoginOpenID failed: %d = %s",
+                status, get_rods_error_msg(status));
+    }
+    return status;
 }
 
 /**
@@ -268,7 +280,7 @@ static authn_status rods_login(
                 r,
                 *rods_conn,
                 password_buf
-            )
+            );
         } else if (conf->rods_auth_scheme == DAVRODS_AUTH_NATIVE) {
             status = clientLoginWithPassword(*rods_conn, password_buf);
         } else {
