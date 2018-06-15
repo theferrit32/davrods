@@ -56,11 +56,13 @@ static int do_rods_login_openid(
 ) {
     // password here is really the session_id for irods
     int status;
+    const char *AUTH_SCHEME_OPENID = "openid";
+    ap_log_rerror(APLOG_MARK, APLOG_NOTICE, APR_SUCCESS, r, "do_rods_login_openid context: %s", password);
     if ( password ) {
-        status = clientLoginOpenID(rods_conn, password, 0);
+        status = clientLogin(rods_conn, password, AUTH_SCHEME_OPENID);
     }
     else {
-        status = clientLoginOpenID(rods_conn, password, 0);
+        status = clientLogin(rods_conn, password, AUTH_SCHEME_OPENID);
     }
     if ( status < 0 ) {
         ap_log_rerror(APLOG_MARK, APLOG_NOTICE, APR_SUCCESS, r,
@@ -247,7 +249,7 @@ static authn_status rods_login(
         // clientLoginWithPassword()'s signature specifies a WRITABLE password parameter.
         // I don't expect it to actually write to this field, but we'll play it
         // safe and pass it a temporary buffer.
-        if (strlen(password) > 63) {
+        if (strlen(password) > 63 && conf->rods_auth_scheme != DAVRODS_AUTH_OPENID ) {
             // iRODS 4.1 appears to limit password length to 50 characters.
             ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
                           "Password exceeds length limits (%lu vs 63)", strlen(password));
