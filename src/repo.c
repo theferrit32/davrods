@@ -1074,6 +1074,7 @@ static dav_error *deliver_file(
     strcpy(open_params.objPath, resource->info->rods_path);
 
     // Redirect connection to resource server
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, resource->info->r, "redirecting for path: %s", open_params.objPath );
     redirectConnToRescSvr(
             &resource->info->rods_conn,
             &open_params,
