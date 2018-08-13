@@ -27,6 +27,10 @@
 #include <irods/rodsClient.h>
 #include <irods/rods.h>
 
+// for connection redirection
+#include <irods/sockComm.h>
+#include <irods/rcConnect.h>
+
 dav_error *davrods_byterange_deliver_file(const dav_resource *resource,
                                           openedDataObjInp_t *data_obj,
                                           ap_filter_t        *output,

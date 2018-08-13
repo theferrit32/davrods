@@ -1073,6 +1073,13 @@ static dav_error *deliver_file(
     open_params.openFlags = O_RDONLY;
     strcpy(open_params.objPath, resource->info->rods_path);
 
+    // Redirect connection to resource server
+    redirectConnToRescSvr(
+            &resource->info->rods_conn,
+            &open_params,
+            resource->info->rods_env,
+            RECONN_TIMEOUT );
+
     int status;
 
     if ((status = rcDataObjOpen(resource->info->rods_conn, &open_params)) < 0) {
@@ -1201,6 +1208,18 @@ static dav_error *deliver_directory(
     strcpy(coll_inp.collName, resource->info->rods_path);
 
     collHandle_t coll_handle = { 0 };
+    
+    // Redirect connection to resource server
+    // fill in fields needed for redirect
+    dataObjInp_t obj_inp = {
+        .oprType = GET_OPR
+    };
+    strcpy(obj_inp.objPath, coll_inp.collName);
+    redirectConnToRescSvr(
+            &resource->info->rods_conn,
+            &obj_inp,
+            resource->info->rods_env,
+            RECONN_TIMEOUT );
 
     // Open the collection.
     collEnt_t    coll_entry;
