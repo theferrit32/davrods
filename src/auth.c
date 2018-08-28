@@ -66,7 +66,7 @@ static int do_rods_login_openid(
     }
     if ( status < 0 ) {
         ap_log_rerror(APLOG_MARK, APLOG_NOTICE, APR_SUCCESS, r,
-                "clientLoginOpenID failed: %d = %s",
+                "clientLogin failed: %d = %s",
                 status, get_rods_error_msg(status));
     }
     return status;
